@@ -1838,6 +1838,13 @@ func (d *DB) ingest(ctx context.Context, args ingestArgs) (IngestOperationStats,
 		}
 
 		d.mu.Lock()
+		if d.opts.ExperimentalOptimisticConditionalBatches {
+			// Record the ingest's sequence number and key bounds so that
+			// concurrent conditional batches can distinguish an external file
+			// ingestion from an ordinary point write. This includes failed
+			// ingests: a conservative conflict in that case is safe.
+			d.recordConditionalIngestLocked(seqNum, overlapBounds)
+		}
 		defer func() {
 			if args.ExciseSpan.Valid() && !asFlushable {
 				// This can conflict with a concurrent EFOS creation (unlike a

@@ -5,6 +5,7 @@
 package pebble
 
 import (
+	"context"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -352,6 +353,166 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
 	b.commitStats.TotalDuration = commitStartTime.Elapsed()
 
 	return err
+}
+
+// commitConditional commits a conditional batch. It mirrors Commit but
+// validates the read set atomically with the sequence-number/WAL handling:
+//
+//  1. Under commitPipeline.mu, wait until every previously sequenced batch
+//     is visible (the same barrier AllocateSeqNum performs for ingests).
+//  2. While still holding commitPipeline.mu and DB.mu, validate the read set
+//     against the now-current state. No sequence number is allocated, no
+//     batch is enqueued and nothing is written on conflict, so a conflicted
+//     commit leaves no memtable, WAL, blob or version metadata side effect.
+//  3. On success, enqueue the batch, allocate its sequence number and write
+//     the WAL record in the same critical section, then apply and publish
+//     like an ordinary commit. All writes share one sequence number and one
+//     WAL record.
+//
+// The caller is responsible for all other pre-checks (see DB.applyInternal).
+// REQUIRES: noSyncWait => syncWAL
+func (p *commitPipeline) commitConditional(
+	ctx context.Context,
+	d *DB,
+	b *Batch,
+	rs *optimisticReadSet,
+	syncWAL bool,
+	noSyncWait bool,
+) error {
+	n := uint64(b.Count())
+	if n == invalidBatchCount {
+		return ErrInvalidBatch
+	}
+
+	commitStartTime := crtime.NowMono()
+	p.commitQueueSem <- struct{}{}
+
+	// A read-only conditional batch (no writes) is validated only: no
+	// sequence number is allocated and no WAL record is written.
+	if b.Empty() {
+		defer func() { <-p.commitQueueSem }()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		nextSeq := p.env.logSeqNum.Load()
+		for p.env.visibleSeqNum.Load() != nextSeq {
+			if err := ctx.Err(); err != nil {
+				b.db = nil
+				return &ConditionalCommitError{Stage: CommitStageCanceled, Err: err}
+			}
+			runtime.Gosched()
+		}
+		d.mu.Lock()
+		conflict := rs.validate(d, nextSeq)
+		d.mu.Unlock()
+		if conflict != nil {
+			b.db = nil
+			return conflict
+		}
+		return nil
+	}
+
+	if syncWAL {
+		p.logSyncQSem <- struct{}{}
+	}
+	// releaseEarly releases the reservations when the WAL writer was never
+	// invoked (conflict or pre-write cancellation); the LogWriter drains
+	// logSyncQSem itself once a record is written.
+	releaseEarly := func() {
+		<-p.commitQueueSem
+		if syncWAL {
+			<-p.logSyncQSem
+		}
+	}
+
+	p.mu.Lock()
+
+	// Barrier: all batches already sequenced must be visible before we
+	// validate. This cannot be bypassed by concurrent Batch.Commit/Apply
+	// (serialized on p.mu), Ingest (AllocateSeqNum takes p.mu) or WAL
+	// rotations (which hold p.mu); flush and compaction only reorganize
+	// existing versions and install them under DB.mu.
+	nextSeq := p.env.logSeqNum.Load()
+	for p.env.visibleSeqNum.Load() != nextSeq {
+		if err := ctx.Err(); err != nil {
+			p.mu.Unlock()
+			releaseEarly()
+			b.db = nil
+			return &ConditionalCommitError{Stage: CommitStageCanceled, Err: err}
+		}
+		runtime.Gosched()
+	}
+
+	// Validate against the current state under DB.mu. Flush and compaction
+	// publish new versions (and rotate memtable queues) under DB.mu, while
+	// this is held the probed state cannot change. Ingested flushables and
+	// memtable writes are already visible due to the barrier.
+	d.mu.Lock()
+	conflict := rs.validate(d, nextSeq)
+	d.mu.Unlock()
+	if conflict != nil {
+		p.mu.Unlock()
+		releaseEarly()
+		b.db = nil
+		return conflict
+	}
+	if err := ctx.Err(); err != nil {
+		p.mu.Unlock()
+		releaseEarly()
+		b.db = nil
+		return &ConditionalCommitError{Stage: CommitStageCanceled, Err: err}
+	}
+
+	// The read set is satisfied. From this point the commit is
+	// irreversible: prepare the wait-group accounting (as in prepare),
+	// enqueue, allocate the sequence number and write the single WAL record
+	// while holding p.mu.
+	var syncWG *sync.WaitGroup
+	var syncErr *error
+	switch {
+	case !syncWAL:
+		b.commit.Add(1)
+	case noSyncWait:
+		syncErr = &b.commitErr
+		syncWG = &b.fsyncWait
+		b.commit.Add(1)
+		b.fsyncWait.Add(1)
+	default:
+		syncErr = &b.commitErr
+		syncWG = &b.commit
+		b.commit.Add(2)
+	}
+
+	p.pending.enqueue(b)
+	b.setSeqNum(p.env.logSeqNum.Add(base.SeqNum(n)) - base.SeqNum(n))
+
+	mem, err := p.env.write(b, syncWG, syncErr)
+	p.mu.Unlock()
+	if err != nil {
+		// The record may have reached the WAL before the failure.
+		b.db = nil
+		return newConditionalCommitError(CommitStageWALWrite, err)
+	}
+
+	if err := p.env.apply(b, mem); err != nil {
+		// The WAL record exists even though applying failed.
+		b.db = nil
+		return newConditionalCommitError(CommitStageApply, err)
+	}
+
+	p.publish(b)
+	<-p.commitQueueSem
+
+	var retErr error
+	if !noSyncWait {
+		if b.commitErr != nil {
+			// The record was written and made visible, but its durability
+			// could not be confirmed.
+			b.db = nil
+			retErr = newConditionalCommitError(CommitStageSync, b.commitErr)
+		}
+	}
+	b.commitStats.TotalDuration = commitStartTime.Elapsed()
+	return retErr
 }
 
 // AllocateSeqNum allocates count sequence numbers, invokes the prepare

@@ -513,6 +513,22 @@ type DB struct {
 			ongoingExcisesRemovedCond *sync.Cond
 		}
 
+		// conditional contains bookkeeping used by the optimistic
+		// conditional batch feature (see
+		// Options.ExperimentalOptimisticConditionalBatches). Protected by
+		// d.mu.
+		conditional struct {
+			// ingests records the sequence number and key bounds of every
+			// external file ingest (and ingest-and-excise) that has allocated
+			// a sequence number, in sequence number order. Conditional batches
+			// consult it to distinguish an external file ingestion conflict
+			// from an ordinary point write. Entries older than the oldest open
+			// snapshot are pruned: every conditional batch pins a snapshot for
+			// the lifetime of its read set, so no live conditional batch can
+			// observe a pruned entry.
+			ingests []ingestConflictRecord
+		}
+
 		tableStats struct {
 			// Condition variable used to signal the completion of a
 			// job to collect table stats.

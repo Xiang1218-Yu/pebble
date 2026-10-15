@@ -760,6 +760,23 @@ type Options struct {
 	// Experimental.
 	ValidateOnIngest bool
 
+	// ExperimentalOptimisticConditionalBatches enables the optimistic
+	// conditional batch API (see DB.NewConditionalBatch). A conditional batch
+	// pairs a set of write operations with a read set collected against a
+	// snapshot. At commit time the read set is atomically validated inside the
+	// commit pipeline: if any concurrent point write, merge, range deletion,
+	// range key operation or external file ingest has modified any of the keys
+	// or key ranges in the read set since the snapshot, the commit is rejected
+	// without leaving any state behind.
+	//
+	// The feature is opt-in and disabled by default. When disabled, the
+	// commit pipeline and all existing read and write paths are unchanged.
+	//
+	// By default, this value is false.
+	//
+	// Experimental.
+	ExperimentalOptimisticConditionalBatches bool
+
 	// LevelMultiplier configures the size multiplier used to determine the
 	// desired size of each level of the LSM. Defaults to 10.
 	LevelMultiplier int
