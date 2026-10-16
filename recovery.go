@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"io"
 	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/batchrepr"
@@ -59,6 +60,21 @@ func (rs *recoveredState) init(opts *Options, dirname string) error {
 	rs.fmv, rs.fmvMarker, err = lookupFormatMajorVersion(opts.FS, dirname, rs.ls)
 	if err != nil {
 		return errors.Wrapf(err, "pebble: database %q", dirname)
+	}
+
+	// Locate any staged format upgrade plan recovery marker. The marker is
+	// reconciled later, after the version set has been initialized. We always
+	// scan for it, even when the plan capability is not enabled: an
+	// interrupted upgrade must never be silently interpreted under an older
+	// format. To keep ordinary opens byte-identical to databases that never
+	// used the plan capability, only open a marker handle when a marker file
+	// is actually present in the directory listing.
+	if listingHasMarker(rs.ls, formatUpgradePlanMarkerName) {
+		rs.upgradeMarker, rs.upgradeMarkerValue, err = atomicfs.LocateMarkerInListing(
+			opts.FS, dirname, formatUpgradePlanMarkerName, rs.ls)
+		if err != nil {
+			return errors.Wrapf(err, "pebble: database %q", dirname)
+		}
 	}
 	// If there is no format-version marker file, the directory must either be
 	// empty (a fresh store), have been written by a Pebble version that used
@@ -193,6 +209,19 @@ func (rs *recoveredState) init(opts *Options, dirname string) error {
 	return nil
 }
 
+// listingHasMarker reports whether ls contains a marker file for the named
+// marker. It only inspects names; malformed marker files are left for
+// LocateMarkerInListing to reject.
+func listingHasMarker(ls []string, markerName string) bool {
+	prefix := "marker." + markerName + "."
+	for _, name := range ls {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // recoveredState encapsulates state recovered from reading the database
 // directory.
 type recoveredState struct {
@@ -200,6 +229,8 @@ type recoveredState struct {
 	dirs                    *resolvedDirs
 	fmv                     FormatMajorVersion
 	fmvMarker               *atomicfs.Marker
+	upgradeMarker           *atomicfs.Marker
+	upgradeMarkerValue      string
 	fs                      vfs.FS
 	ls                      []string
 	manifestMarker          *atomicfs.Marker
@@ -223,6 +254,12 @@ func (rs *recoveredState) RemoveObsolete(opts *Options) error {
 	}
 	if rs.manifestMarker != nil {
 		err = errors.CombineErrors(err, rs.manifestMarker.RemoveObsolete())
+	}
+	// Obsolete upgrade marker files are superseded iterations of the same
+	// marker (left behind by a crash mid-Move). They never carry current
+	// state and are safe to remove regardless of plan capability.
+	if rs.upgradeMarker != nil {
+		err = errors.CombineErrors(err, rs.upgradeMarker.RemoveObsolete())
 	}
 	// Some codepaths write to a temporary file and then rename it to its final
 	// location when complete.  A temp file is leftover if a process exits
@@ -276,6 +313,9 @@ func (rs *recoveredState) Close() error {
 	var err error
 	if rs.fmvMarker != nil {
 		err = errors.CombineErrors(err, rs.fmvMarker.Close())
+	}
+	if rs.upgradeMarker != nil {
+		err = errors.CombineErrors(err, rs.upgradeMarker.Close())
 	}
 	if rs.manifestMarker != nil {
 		err = errors.CombineErrors(err, rs.manifestMarker.Close())

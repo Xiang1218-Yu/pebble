@@ -635,6 +635,23 @@ type Options struct {
 	// SSTs or log records to replay.
 	ErrorIfNotPristine bool
 
+	// EnableFormatUpgradePlan enables the opt-in, staged format upgrade plan
+	// capability (DB.NewFormatUpgradePlan, DB.ExecuteFormatUpgradePlan and
+	// DB.AbortFormatUpgradePlan). The capability is default-off: when false,
+	// Open, writes, recovery, performance and RatchetFormatMajorVersion keep
+	// their historical semantics.
+	//
+	// If an interrupted plan is discovered during Open (because a previous
+	// process crashed or was closed mid-upgrade), the database is opened in a
+	// blocked "upgrade pending" state when this option is true, allowing the
+	// same plan to be resubmitted and continued. When this option is false (or
+	// the database is opened read-only), Open instead fails with
+	// ErrFormatUpgradeRecoveryRequired rather than silently interpreting the
+	// database under an older format.
+	//
+	// The default value is false.
+	EnableFormatUpgradePlan bool
+
 	// EventListener provides hooks to listening to significant DB events such as
 	// flushes, compactions, and table deletion.
 	EventListener *EventListener

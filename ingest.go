@@ -1344,6 +1344,9 @@ func (d *DB) Ingest(ctx context.Context, paths []string) error {
 	if d.opts.ReadOnly {
 		return ErrReadOnly
 	}
+	if d.formatUpgradeActive.Load() {
+		return d.formatUpgradeBlocked("ingest")
+	}
 	localSSTs := make([]LocalSST, len(paths))
 	for i, path := range paths {
 		localSSTs[i] = LocalSST{Path: path}
@@ -1467,6 +1470,9 @@ func (d *DB) IngestExternalFiles(
 
 	if d.opts.ReadOnly {
 		return IngestOperationStats{}, ErrReadOnly
+	}
+	if d.formatUpgradeActive.Load() {
+		return IngestOperationStats{}, d.formatUpgradeBlocked("ingest external files")
 	}
 	if d.opts.RemoteStorage == nil {
 		return IngestOperationStats{}, errors.New("pebble: cannot ingest external files without shared storage configured")

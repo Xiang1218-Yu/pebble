@@ -537,6 +537,10 @@ func (d *DB) ratchetFormatMajorVersionLocked(formatVers FormatMajorVersion) erro
 	if d.mu.formatVers.ratcheting {
 		return errors.Newf("pebble: database format major version upgrade is in-progress")
 	}
+	if d.formatUpgradeActive.Load() {
+		return errors.Wrap(ErrFormatUpgradeInProgress,
+			"ratchet format major version; use ExecuteFormatUpgradePlan to continue the staged upgrade")
+	}
 	d.mu.formatVers.ratcheting = true
 	defer func() { d.mu.formatVers.ratcheting = false }()
 

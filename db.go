@@ -311,12 +311,20 @@ type DB struct {
 	}
 
 	closed *atomic.Value
+	// formatUpgradeActive is true while a format upgrade plan is executing
+	// or while an interrupted plan is blocking the database after recovery.
+	// It may be read without d.mu on the write hot path.
+	formatUpgradeActive atomic.Bool
 	// bgCtx is cancelled when the DB is closing. Background goroutines
 	// (compactions, table stats loading) use this context so their I/O is
 	// unblocked during Close().
 	bgCtx       context.Context
 	bgCtxCancel context.CancelFunc
 	closedCh    chan struct{}
+
+	// Test-only instrumentation for format upgrade plans.
+	formatUpgradeTestBeforeStage func(v FormatMajorVersion) error
+	formatUpgradeTestAfterStage  func(v FormatMajorVersion) error
 
 	deletePacer *deletepacer.DeletePacer
 
@@ -361,6 +369,17 @@ type DB struct {
 			// to vers + 1. As a part of ratcheting the format major version,
 			// migrations may drop and re-acquire the mutex.
 			ratcheting bool
+		}
+
+		// formatUpgrade tracks the opt-in, staged format upgrade plan
+		// capability. marker is the persisted recovery marker handle (nil
+		// when no marker exists). pending is non-nil when an interrupted
+		// plan was recovered during Open. running is non-nil while a plan
+		// is executing within this process.
+		formatUpgrade struct {
+			marker  *atomicfs.Marker
+			pending *formatUpgradeRecovery
+			running *formatUpgradeExecution
 		}
 
 		// The ID of the next job. Job IDs are passed to event listener
@@ -798,6 +817,9 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 	}
 	if d.opts.ReadOnly {
 		return ErrReadOnly
+	}
+	if d.formatUpgradeActive.Load() {
+		return d.formatUpgradeBlocked("write")
 	}
 	if batch.db != nil && batch.db != d {
 		panic(errors.AssertionFailedf("pebble: batch db mismatch: %p != %p", errors.Safe(batch.db), errors.Safe(d)))
@@ -1881,6 +1903,9 @@ func (d *DB) Close() error {
 		err = errors.Errorf("pebble: %d unexpected in-progress compactions", errors.Safe(n))
 	}
 	err = firstError(err, d.mu.formatVers.marker.Close())
+	if d.mu.formatUpgrade.marker != nil {
+		err = firstError(err, d.mu.formatUpgrade.marker.Close())
+	}
 	if !d.opts.ReadOnly {
 		if d.mu.log.writer != nil {
 			_, err2 := d.mu.log.writer.Close()
@@ -1984,6 +2009,9 @@ func (d *DB) Compact(ctx context.Context, start, end []byte, parallelize bool) e
 	}
 	if d.opts.ReadOnly {
 		return ErrReadOnly
+	}
+	if d.formatUpgradeActive.Load() {
+		return d.formatUpgradeBlocked("manual compaction")
 	}
 	if d.cmp(start, end) >= 0 {
 		return errors.Errorf("Compact start %s is not less than end %s",
@@ -2206,6 +2234,9 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 	}
 	if d.opts.ReadOnly {
 		return nil, ErrReadOnly
+	}
+	if d.formatUpgradeActive.Load() {
+		return nil, d.formatUpgradeBlocked("flush")
 	}
 
 	d.commit.mu.Lock()

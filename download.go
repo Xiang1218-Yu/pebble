@@ -61,6 +61,9 @@ func (d *DB) Download(ctx context.Context, spans []DownloadSpan) error {
 	if d.opts.ReadOnly {
 		return ErrReadOnly
 	}
+	if d.formatUpgradeActive.Load() {
+		return d.formatUpgradeBlocked("download")
+	}
 	info := DownloadInfo{
 		JobID: int(d.newJobID()),
 		Spans: spans,

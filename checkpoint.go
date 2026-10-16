@@ -152,6 +152,13 @@ func (d *DB) Checkpoint(
 		fn(opt)
 	}
 
+	// Checkpoints are blocked while an upgrade is active or pending: a
+	// checkpoint captured mid-upgrade could mix files from adjacent format
+	// major versions without a recovery marker, making it unrecognizable.
+	if d.formatUpgradeActive.Load() {
+		return d.formatUpgradeBlocked("checkpoint")
+	}
+
 	if _, err := d.opts.FS.Stat(destDir); !oserror.IsNotExist(err) {
 		if err == nil {
 			return &os.PathError{

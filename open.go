@@ -208,6 +208,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 			if d.mu.versions.manifestFile != nil {
 				_ = d.mu.versions.manifestFile.Close()
 			}
+			if d.mu.formatUpgrade.marker != nil {
+				_ = d.mu.formatUpgrade.marker.Close()
+			}
 			if d.iterTracker != nil {
 				d.iterTracker.Close()
 				d.iterTracker = nil
@@ -277,6 +280,18 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 				return nil, errors.Wrapf(ErrDBNotPristine, "dirname=%q", dirname)
 			}
 		}
+	}
+
+	// Hand over the format upgrade plan recovery marker handle. From this
+	// point on d.mu.formatUpgrade.marker owns it; reconciliation closes it if
+	// there is nothing to recover and DB.Close closes it otherwise. The
+	// reconciliation detects completed/interrupted/corrupt upgrade markers
+	// before WAL replay, so the database is never silently interpreted under
+	// an older format.
+	d.mu.formatUpgrade.marker = rs.upgradeMarker
+	rs.upgradeMarker = nil
+	if err := d.recoverFormatUpgradePlanOnOpenLocked(rs.upgradeMarkerValue); err != nil {
+		return nil, err
 	}
 
 	// In read-only mode, we replay directly into the mutable memtable but never
@@ -446,9 +461,14 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	d.compactionScheduler.Register(2, d)
 	compactionSchedulerRegistered = true
 	if !d.opts.ReadOnly {
-		d.maybeScheduleFlush()
-		for d.mu.compact.flushing {
-			d.mu.compact.cond.Wait()
+		if !d.formatUpgradePendingLocked() {
+			// While an interrupted plan is pending, do not flush the
+			// replayed WAL: a new SSTable would change the file collection
+			// the plan was generated against.
+			d.maybeScheduleFlush()
+			for d.mu.compact.flushing {
+				d.mu.compact.cond.Wait()
+			}
 		}
 
 		// Create an empty .log file for the mutable memtable.
@@ -464,15 +484,23 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	if !d.opts.ReadOnly {
-		// If the Options specify a format major version higher than the
-		// loaded database's, upgrade it. If this is a new database, this
-		// code path also performs an initial upgrade from the starting
-		// implicit MinSupported version.
-		//
-		// We ratchet the version this far into Open so that migrations have a read
-		// state available. Note that this also results in creating/updating the
-		// format version marker file.
-		if opts.FormatMajorVersion > d.FormatMajorVersion() {
+		if d.formatUpgradePendingLocked() {
+			// Do not auto-ratchet past an interrupted plan. The Options may
+			// request a higher version, but the staged upgrade must be
+			// continued explicitly through ExecuteFormatUpgradePlan.
+			if noFormatVersionMarker {
+				return nil, formatUpgradeError(FormatUpgradeInconsistentRecoveryMarkerReason,
+					"recovery marker exists without a format version marker")
+			}
+		} else if opts.FormatMajorVersion > d.FormatMajorVersion() {
+			// If the Options specify a format major version higher than the
+			// loaded database's, upgrade it. If this is a new database, this
+			// code path also performs an initial upgrade from the starting
+			// implicit MinSupported version.
+			//
+			// We ratchet the version this far into Open so that migrations have a read
+			// state available. Note that this also results in creating/updating the
+			// format version marker file.
 			if err := d.ratchetFormatMajorVersionLocked(opts.FormatMajorVersion); err != nil {
 				return nil, err
 			}
@@ -491,8 +519,12 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	d.calculateDiskAvailableBytes()
 
-	d.maybeScheduleFlush()
-	d.maybeScheduleCompaction()
+	// Suppress background scheduling while an interrupted plan awaits
+	// continuation; ExecuteFormatUpgradePlan resumes scheduling on completion.
+	if !d.formatUpgradePendingLocked() {
+		d.maybeScheduleFlush()
+		d.maybeScheduleCompaction()
+	}
 
 	// Locks in RecoveryDirLocks can be closed as soon as we've finished opening
 	// the database.
