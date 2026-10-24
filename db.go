@@ -542,6 +542,13 @@ type DB struct {
 			// validating is set to true when validation is running.
 			validating bool
 		}
+
+		// ingestPlans holds the in-memory registry of prepared, committed and
+		// invalidated ingest plans (see ingest_plan.go). Plans are not
+		// persisted; reopening the DB empties this registry.
+		ingestPlans struct {
+			plans map[IngestPlanID]*ingestPlanState
+		}
 	}
 
 	tableDiskUsageAnnotator    manifest.TableAnnotator[TableUsageByPlacement]
@@ -555,6 +562,11 @@ type DB struct {
 	// the time at database Open; may be used to compute metrics like effective
 	// compaction concurrency
 	openedAt time.Time
+
+	// ingestPlanCommitMu serializes commits of experimental ingest plans so
+	// that concurrent commits of the same plan are handled idempotently
+	// instead of racing. It does not affect the regular Ingest path.
+	ingestPlanCommitMu sync.Mutex
 
 	compressionCounters block.CompressionCounters
 

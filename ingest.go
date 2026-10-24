@@ -252,6 +252,24 @@ type ingestLocalResult struct {
 	lastRangeKey   keyspan.Span
 	blockReadStats base.BlockReadStats
 	blobMetas      []manifest.BlobFileMetadata
+	// props is the table's properties block. It is populated for all
+	// successfully loaded local tables and is used by ingest plan generation.
+	props *sstable.Properties
+	// rangeDelSpans are the user key bounds of all range deletion fragments
+	// in the table ([start, end) for every fragment). It is empty if the
+	// table contains no range deletions. It is used by ingest plan
+	// generation to detect conflicts between range deletions and point keys
+	// in other tables of the same batch.
+	rangeDelSpans []base.UserKeyBounds
+	// tableFormat is the on-disk format of the table. It is populated for
+	// all successfully loaded local tables and is used by ingest plan
+	// generation to record the format in the plan.
+	tableFormat sstable.TableFormat
+	// firstRangeKey is the first range key span of the table (or an invalid
+	// span if the table has no range keys). It is used by ingest plan
+	// generation to replay suffixed-boundary validation in the canonical
+	// (sorted) file order.
+	firstRangeKey keyspan.Span
 }
 
 // ingestLoad1 creates the TableMetadata for one file. This file will be owned
@@ -305,11 +323,13 @@ func ingestLoad1(
 			tf, fmv, fmv.MinTableFormat(), fmv.MaxTableFormat(),
 		)
 	}
+	res.tableFormat = tf
 
 	props, err := r.ReadPropertiesBlock(ctx, nil /* buffer pool */)
 	if err != nil {
 		return ingestLocalResult{}, err
 	}
+	res.props = &props
 
 	// If this is a columnar block, read key schema name from properties block.
 	if tf.BlockColumnar() {
@@ -410,23 +430,43 @@ func ingestLoad1(
 	if iter != nil {
 		defer iter.Close()
 		var smallest InternalKey
-		if s, err := iter.First(); err != nil {
+		firstSpan, err := iter.First()
+		if err != nil {
 			return ingestLocalResult{}, err
-		} else if s != nil {
-			key := s.SmallestKey()
+		}
+		if firstSpan != nil && len(firstSpan.Keys) > 0 {
+			key := firstSpan.SmallestKey()
 			if err := ingestValidateKey(opts, &key); err != nil {
 				return ingestLocalResult{}, err
 			}
 			smallest = key.Clone()
 		}
-		if s, err := iter.Last(); err != nil {
+		// Record the [start,end) bounds of every range deletion fragment for
+		// ingest plan generation. This extra traversal only runs when the
+		// feature is enabled; the regular ingest path pays no additional cost.
+		// The iterator may surface spans without keys; skip those.
+		if opts.ExperimentalBatchIngestPlans && firstSpan != nil {
+			for s := firstSpan; s != nil; {
+				if len(s.Keys) > 0 {
+					span := s.Clone()
+					res.rangeDelSpans = append(res.rangeDelSpans, base.UserKeyBoundsEndExclusive(span.Start, span.End))
+				}
+				s, err = iter.Next()
+				if err != nil {
+					return ingestLocalResult{}, err
+				}
+			}
+		}
+		lastSpan, err := iter.Last()
+		if err != nil {
 			return ingestLocalResult{}, err
-		} else if s != nil {
-			k := s.SmallestKey()
+		}
+		if lastSpan != nil && len(lastSpan.Keys) > 0 {
+			k := lastSpan.SmallestKey()
 			if err := ingestValidateKey(opts, &k); err != nil {
 				return ingestLocalResult{}, err
 			}
-			largest := s.LargestKey().Clone()
+			largest := lastSpan.LargestKey().Clone()
 			meta.ExtendPointKeyBounds(opts.Comparer.Compare, smallest, largest)
 		}
 	}
@@ -448,6 +488,11 @@ func ingestLoad1(
 					return ingestLocalResult{}, err
 				}
 				smallest = key.Clone()
+				// The first span is retained only for ingest plan generation;
+				// avoid the clone on the regular ingest path.
+				if opts.ExperimentalBatchIngestPlans {
+					res.firstRangeKey = s.Clone()
+				}
 				// Range keys need some additional validation as we need to ensure they
 				// defragment cleanly with the lastRangeKey from the previous file.
 				if err := rangeKeyValidator.Validate(s); err != nil {
@@ -1735,6 +1780,19 @@ type ingestArgs struct {
 	// SkipRemoteProbe, when true, skips probing existing LSM files with remote
 	// backings during level targeting, while still probing local files.
 	SkipRemoteProbe bool
+	// noFlushable, when true, disables ingesting the sstables as a flushable
+	// ingest; the synchronous memtable flush path is used instead. Used by
+	// ingest plans which must publish all files through a single version
+	// edit.
+	noFlushable bool
+	// planVerification, when non-nil, is invoked while holding the manifest
+	// log lock, after the target level for every new table has been decided
+	// but before the version edit is logged. If it returns an error, no
+	// version edit is applied and the ingestion fails, triggering cleanup of
+	// any linked files. It is used exclusively by experimental ingest plans
+	// to optimistically re-confirm plan preconditions at commit time; it is
+	// nil on every regular ingest path.
+	planVerification func(ve *manifest.VersionEdit, lr ingestLoadResult, current *manifest.Version) error
 }
 
 // See comment at Ingest() for details on how this works.
@@ -1945,7 +2003,7 @@ func (d *DB) ingest(ctx context.Context, args ingestArgs) (IngestOperationStats,
 			// of this problem.
 			(len(d.mu.mem.queue) < d.opts.MemTableStopWritesThreshold ||
 				d.mu.log.manager.ElevateWriteStallThresholdForFailover()) &&
-			!d.opts.DisableIngestAsFlushable() && !hasRemoteFiles &&
+			!d.opts.DisableIngestAsFlushable() && !hasRemoteFiles && !args.noFlushable &&
 			(!args.ExciseSpan.Valid() || d.FormatMajorVersion() >= FormatFlushableIngestExcises)
 		if !canIngestFlushable {
 			// We're not able to ingest as a flushable,
@@ -2037,7 +2095,7 @@ func (d *DB) ingest(ctx context.Context, args ingestArgs) (IngestOperationStats,
 		}
 		// Assign the sstables to the correct level in the LSM and apply the
 		// version edit.
-		ve, manifestUpdateDuration, err = d.ingestApply(ctx, jobID, loadResult, mut, args.ExciseSpan, args.ExciseBoundsPolicy, exciseSeqNum, args.SkipRemoteProbe)
+		ve, manifestUpdateDuration, err = d.ingestApply(ctx, jobID, loadResult, mut, args.ExciseSpan, args.ExciseBoundsPolicy, exciseSeqNum, args.SkipRemoteProbe, args.planVerification)
 	}
 
 	// Only one ingest can occur at a time because if not, one would block waiting
@@ -2282,6 +2340,7 @@ func (d *DB) ingestApply(
 	exciseBoundsPolicy exciseBoundsPolicy,
 	exciseSeqNum base.SeqNum,
 	skipRemoteProbe bool,
+	planVerification func(ve *manifest.VersionEdit, lr ingestLoadResult, current *manifest.Version) error,
 ) (*manifest.VersionEdit, time.Duration, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -2323,8 +2382,13 @@ func (d *DB) ingestApply(
 			objProvider:     d.objProvider,
 			skipRemoteProbe: skipRemoteProbe,
 		}
+		// Ingest plans disable ingest-time splitting: levels were decided at
+		// plan time with splitting disabled, and a split-produced placement
+		// would be rejected by the commit gate anyway. planVerification is
+		// non-nil only for ingest plan commits.
 		shouldIngestSplit := d.opts.IngestSplit != nil &&
-			d.opts.IngestSplit() && d.FormatMajorVersion() >= FormatVirtualSSTables
+			d.opts.IngestSplit() && d.FormatMajorVersion() >= FormatVirtualSSTables &&
+			planVerification == nil
 		baseLevel := d.mu.versions.picker.getBaseLevel()
 		// filesToSplit is a list where each element is a pair consisting of a file
 		// being ingested and a file being split to make room for an ingestion into
@@ -2509,6 +2573,17 @@ func (d *DB) ingestApply(
 						}
 					}
 				}
+			}
+		}
+
+		if planVerification != nil {
+			// This is the optimistic commit-time gate used by ingest plans. We
+			// are holding the manifest log lock so the current version cannot
+			// change before the version edit is logged. If verification
+			// fails, return without a version update: nothing has been
+			// applied to the LSM and the caller cleans up any linked files.
+			if err := planVerification(ve, lr, current); err != nil {
+				return versionUpdate{}, err
 			}
 		}
 

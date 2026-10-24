@@ -760,6 +760,27 @@ type Options struct {
 	// Experimental.
 	ValidateOnIngest bool
 
+	// ExperimentalBatchIngestPlans enables the experimental, two-phase
+	// PrepareIngestPlan/CommitIngestPlan API for atomically ingesting a
+	// batch of external local sstables.
+	//
+	// When enabled, a caller may first create an immutable ingest plan from
+	// the current DB version (recording file identities, key bounds,
+	// checksums, target levels and a version fingerprint), and later commit
+	// the plan. Commit optimistically re-verifies that the database version,
+	// source files and in-progress compactions still satisfy the plan and
+	// publishes all files in a single, atomic version edit; any verification
+	// or apply failure rolls back the entire batch.
+	//
+	// This option does not change the behavior of the regular Ingest
+	// methods. It is not serialized to the OPTIONS file and plans are not
+	// persisted across DB reopen.
+	//
+	// The default value is false.
+	//
+	// Experimental.
+	ExperimentalBatchIngestPlans bool
+
 	// LevelMultiplier configures the size multiplier used to determine the
 	// desired size of each level of the LSM. Defaults to 10.
 	LevelMultiplier int
@@ -1273,6 +1294,13 @@ type Options struct {
 		// testingBeforeIngestApplyFunc when non-nil, is called when ingesting,
 		// before calling DB.ingestApply.
 		testingBeforeIngestApplyFunc func()
+
+		// testingIngestPlanVerifyFunc, when non-nil, is invoked by the
+		// ingest plan commit-time verification gate while the manifest log
+		// lock is held and before the version edit is logged. If it returns
+		// an error, the commit is aborted without applying any edit and the
+		// linked files are cleaned up. Used only by tests.
+		testingIngestPlanVerifyFunc func() error
 
 		// timeNow returns the current time. It defaults to time.Now. It's
 		// configurable here so that tests can mock the current time.
