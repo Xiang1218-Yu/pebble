@@ -760,6 +760,23 @@ type Options struct {
 	// Experimental.
 	ValidateOnIngest bool
 
+	// ExperimentalResumableCheckpoints enables resumable checkpoint
+	// publishing through DB.CreateCheckpointPlan and the CheckpointPlan API.
+	// When enabled, a checkpoint may be created incrementally: the caller
+	// first creates an immutable checkpoint plan for a single consistent
+	// version, then copies the checkpoint's files in resumable stages, and
+	// finally atomically commits the checkpoint. Interruptions and failures
+	// never leave an openable half-finished checkpoint, and resuming a plan
+	// only reuses files that still match the plan's recorded sizes and
+	// checksums.
+	//
+	// This setting does not affect the behavior of DB.Checkpoint.
+	//
+	// By default, this value is false.
+	//
+	// Experimental.
+	ExperimentalResumableCheckpoints bool
+
 	// LevelMultiplier configures the size multiplier used to determine the
 	// desired size of each level of the LSM. Defaults to 10.
 	LevelMultiplier int

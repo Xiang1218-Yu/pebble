@@ -311,6 +311,14 @@ type DB struct {
 	}
 
 	closed *atomic.Value
+
+	// checkpointPlans tracks resumable checkpoint plans active in this
+	// process, keyed by destination directory.
+	checkpointPlans struct {
+		mu     sync.Mutex
+		active map[string]struct{}
+	}
+
 	// bgCtx is cancelled when the DB is closing. Background goroutines
 	// (compactions, table stats loading) use this context so their I/O is
 	// unblocked during Close().

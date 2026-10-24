@@ -537,66 +537,25 @@ func (d *DB) writeCheckpointManifest(
 	// copy.
 	// If some files are excluded from the checkpoint, also append a block that
 	// records those files as deleted.
-	if err := func() error {
-		srcPath := base.MakeFilepath(fs, d.dirname, base.FileTypeManifest, manifestFileNum)
-		destPath := fs.PathJoin(destDirPath, fs.PathBase(srcPath))
-		src, err := fs.Open(srcPath, vfs.SequentialReadsOption)
-		if err != nil {
+	var extraVersionEdit []byte
+	if len(excludedTables) > 0 || len(excludedBlobFiles) > 0 {
+		// Write out an additional VersionEdit that deletes the excluded SST files.
+		ve := manifest.VersionEdit{
+			DeletedTables:        excludedTables,
+			RemovedBackingTables: removeBackingTables,
+			DeletedBlobFiles:     excludedBlobFiles,
+		}
+		var buf bytes.Buffer
+		if err := ve.Encode(&buf); err != nil {
 			return err
 		}
-		defer src.Close()
-
-		dst, err := fs.Create(destPath, vfs.WriteCategoryUnspecified)
-		if err != nil {
-			return err
-		}
-		defer dst.Close()
-
-		// Copy all existing records. We need to copy at the record level in case we
-		// need to append another record with the excluded files (we cannot simply
-		// append a record after a raw data copy; see
-		// https://github.com/cockroachdb/cockroach/issues/100935).
-		r := record.NewReader(&io.LimitedReader{R: src, N: manifestSize}, manifestFileNum)
-		w := record.NewWriter(dst)
-		for {
-			rr, err := r.Next()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return err
-			}
-
-			rw, err := w.Next()
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(rw, rr); err != nil {
-				return err
-			}
-		}
-
-		if len(excludedTables) > 0 || len(excludedBlobFiles) > 0 {
-			// Write out an additional VersionEdit that deletes the excluded SST files.
-			ve := manifest.VersionEdit{
-				DeletedTables:        excludedTables,
-				RemovedBackingTables: removeBackingTables,
-				DeletedBlobFiles:     excludedBlobFiles,
-			}
-
-			rw, err := w.Next()
-			if err != nil {
-				return err
-			}
-			if err := ve.Encode(rw); err != nil {
-				return err
-			}
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-		return dst.Sync()
-	}(); err != nil {
+		extraVersionEdit = buf.Bytes()
+	}
+	srcPath := base.MakeFilepath(fs, d.dirname, base.FileTypeManifest, manifestFileNum)
+	destPath := fs.PathJoin(destDirPath, fs.PathBase(srcPath))
+	if err := copyCheckpointManifestFile(
+		fs, srcPath, destPath, manifestFileNum, manifestSize, extraVersionEdit,
+	); err != nil {
 		return err
 	}
 
@@ -619,4 +578,68 @@ func (d *DB) writeCheckpointManifest(
 		return err
 	}
 	return manifestMarker.Close()
+}
+
+// copyCheckpointManifestFile copies the first manifestSize bytes of the
+// MANIFEST at srcPath to dstPath as a sequence of records, optionally
+// appending one additional record whose payload is the already-encoded
+// VersionEdit in extraVersionEdit. The destination file is synced before
+// copyCheckpointManifestFile returns. The MANIFEST marker that points at the
+// file is not touched.
+func copyCheckpointManifestFile(
+	fs vfs.FS,
+	srcPath, dstPath string,
+	manifestFileNum base.DiskFileNum,
+	manifestSize int64,
+	extraVersionEdit []byte,
+) error {
+	src, err := fs.Open(srcPath, vfs.SequentialReadsOption)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := fs.Create(dstPath, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	// Copy all existing records. We need to copy at the record level in case we
+	// need to append another record with the excluded files (we cannot simply
+	// append a record after a raw data copy; see
+	// https://github.com/cockroachdb/cockroach/issues/100935).
+	r := record.NewReader(&io.LimitedReader{R: src, N: manifestSize}, manifestFileNum)
+	w := record.NewWriter(dst)
+	for {
+		rr, err := r.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		rw, err := w.Next()
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(rw, rr); err != nil {
+			return err
+		}
+	}
+
+	if len(extraVersionEdit) > 0 {
+		rw, err := w.Next()
+		if err != nil {
+			return err
+		}
+		if _, err := rw.Write(extraVersionEdit); err != nil {
+			return err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return dst.Sync()
 }
