@@ -89,6 +89,10 @@ type memTable struct {
 	// guaranteed to be less than or equal to any seqnum stored in the memtable.
 	logSeqNum                    base.SeqNum
 	releaseAccountingReservation func()
+
+	// flushableQuota tracks write-quota reservations held until this memtable
+	// flushes.
+	flushableQuota
 }
 
 func (m *memTable) free() {

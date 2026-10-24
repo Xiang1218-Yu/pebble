@@ -441,6 +441,25 @@ type WriteOptions struct {
 	//
 	// The default value is true.
 	Sync bool
+
+	// Priority orders admission when a write has to queue behind a write-quota
+	// rule configured with the WriteQuotaPriority policy: higher values are
+	// granted first, FIFO within equal priority. It has no effect on WAL or
+	// sequence-number ordering and is ignored when write quotas are disabled
+	// or the touched rules do not use the priority policy.
+	//
+	// The default value is 0.
+	//
+	// Experimental.
+	Priority int32
+}
+
+// GetPriority returns the Priority value or zero if the receiver is nil.
+func (o *WriteOptions) GetPriority() int32 {
+	if o == nil {
+		return 0
+	}
+	return o.Priority
 }
 
 // Sync specifies the default write options for writes which synchronize to
@@ -844,6 +863,18 @@ type Options struct {
 	//
 	// Experimental.
 	SpanPolicyFunc SpanPolicyFunc
+
+	// WriteQuotaConfig optionally enables per-user-key-range write quotas.
+	// When nil (the default), write quotas are disabled and writes follow the
+	// exact same ordering, WAL, write-stall and performance behavior as
+	// without the feature. When non-nil, it returns the active
+	// WriteQuotaConfig; returning a new *WriteQuotaConfig atomically
+	// reconfigures the database. In-flight writes remain bound to the
+	// configuration they were admitted under. The function must be cheap and
+	// must not block or perform I/O.
+	//
+	// Experimental.
+	WriteQuotaConfig WriteQuotaConfigFunc
 
 	// VirtualTableRewriteUnreferencedFraction configures the minimum fraction of
 	// unreferenced data in a backing table required to trigger a virtual table
@@ -2808,6 +2839,14 @@ func (o *Options) Validate() error {
 	if o.WALFailover != nil {
 		if err := o.WALFailover.Validate(); err != nil {
 			fmt.Fprintf(&buf, "WALFailover validation failed: %v\n", err)
+		}
+	}
+
+	if o.WriteQuotaConfig != nil {
+		if cfg := o.WriteQuotaConfig(); cfg != nil {
+			if err := cfg.validate(o.Comparer.Compare); err != nil {
+				fmt.Fprintf(&buf, "WriteQuotaConfig validation failed: %v\n", err)
+			}
 		}
 	}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/overlap"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/internal/writequota"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
@@ -1647,6 +1648,7 @@ func (d *DB) handleIngestAsFlushable(
 	seqNum base.SeqNum,
 	exciseSpan KeyRange,
 	blobFiles []manifest.BlobFileMetadata,
+	quotaGrant *writequota.Grant,
 ) error {
 	b := d.NewBatch()
 	if exciseSpan.Valid() {
@@ -1689,6 +1691,11 @@ func (d *DB) handleIngestAsFlushable(
 	entry, err := d.newIngestedFlushableEntry(meta, seqNum, logNum, exciseSpan, blobFiles)
 	if err != nil {
 		return err
+	}
+	// Bind the speculative UnflushedBytes reservation to the flushable; it is
+	// released when the ingested flushable finishes flushing.
+	if qf, ok := entry.flushable.(interface{ addGrant(*writequota.Grant) }); ok {
+		qf.addGrant(quotaGrant)
 	}
 	nextSeqNum := seqNum + base.SeqNum(b.Count())
 
@@ -1776,6 +1783,39 @@ func (d *DB) ingest(ctx context.Context, args ingestArgs) (IngestOperationStats,
 	// Verify the sstables do not overlap.
 	if err := ingestSortAndVerify(d.cmp, loadResult, args.ExciseSpan); err != nil {
 		return IngestOperationStats{}, err
+	}
+
+	// Write-quota admission. This happens before any file is linked or
+	// attached, any object provider sync, any sequence number allocation, or
+	// any MANIFEST edit. The UnflushedBytes component is reserved
+	// speculatively: a flushable ingestion keeps it until its flush completes,
+	// while a direct-to-LSM ingestion releases it as soon as the version edit
+	// is applied.
+	var quotaGrant *writequota.Grant
+	unflushedAttached := false
+	if d.writeQuota != nil {
+		if qc := d.writeQuota.current(); qc != nil {
+			var exciseBounds []KeyRange
+			if args.ExciseSpan.Valid() {
+				exciseBounds = []KeyRange{args.ExciseSpan}
+			}
+			files := loadResultQuotaFiles(&loadResult)
+			demands := qc.buildIngestDemands(files, exciseBounds)
+			demands = mergeUnflushedDemands(demands, qc.buildIngestUnflushed(files))
+			if len(demands) > 0 {
+				g, err := d.writeQuota.wm.Admit(ctx, writequota.Request{Demands: demands})
+				if err != nil {
+					return IngestOperationStats{}, mapWriteQuotaAdmitErr(err)
+				}
+				quotaGrant = g
+				defer func() {
+					quotaGrant.ReleaseCommitted()
+					if !unflushedAttached {
+						quotaGrant.ReleaseUnflushed()
+					}
+				}()
+			}
+		}
 	}
 
 	// Hard link the sstables into the DB directory. Since the sstables aren't
@@ -1980,7 +2020,11 @@ func (d *DB) ingest(ctx context.Context, args ingestArgs) (IngestOperationStats,
 			fileMetas[i] = loadResult.local[i].TableMetadata
 			blobFiles = append(blobFiles, loadResult.local[i].blobFiles...)
 		}
-		err = d.handleIngestAsFlushable(fileMetas, seqNum, args.ExciseSpan, blobFiles)
+		err = d.handleIngestAsFlushable(fileMetas, seqNum, args.ExciseSpan, blobFiles, quotaGrant)
+		if err == nil {
+			// The flushable now owns the UnflushedBytes reservation.
+			unflushedAttached = true
+		}
 	}
 
 	var ve *manifest.VersionEdit

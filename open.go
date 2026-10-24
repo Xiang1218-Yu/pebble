@@ -194,6 +194,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 				_ = d.fileCache.Close()
 			}
 			d.cacheHandle.Close()
+			if d.writeQuota != nil {
+				d.writeQuota.close()
+			}
 
 			for _, mem := range d.mu.mem.queue {
 				switch t := mem.flushable.(type) {
@@ -227,6 +230,10 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 		apply:         d.commitApply,
 		write:         d.commitWrite,
 	})
+	d.writeQuota, err = newWriteQuotaManager(opts.Comparer.Compare, opts.Logger, opts.WriteQuotaConfig)
+	if err != nil {
+		return nil, err
+	}
 	d.mu.nextJobID = 1
 	d.mu.mem.nextSize = min(opts.MemTableSize, initialMemTableSize)
 	d.mu.compact.cond.L = &d.mu.Mutex

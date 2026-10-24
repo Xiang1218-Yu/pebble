@@ -1851,6 +1851,11 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	if err == nil {
 		flushed = d.mu.mem.queue[:n]
 		d.mu.mem.queue = d.mu.mem.queue[n:]
+		// Release write-quota UnflushedBytes reservations bound to the
+		// flushables that have now been flushed. This must happen only after a
+		// successful flush; retries keep the reservation (the data is still
+		// unflushed).
+		releaseFlushablesWriteQuota(flushed)
 		d.updateReadStateLocked(d.opts.DebugCheck)
 		d.updateTableStatsLocked(ve.NewTables)
 		if ingest {

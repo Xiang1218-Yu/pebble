@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manual"
 	"github.com/cockroachdb/pebble/internal/problemspans"
 	"github.com/cockroachdb/pebble/internal/tombspan"
+	"github.com/cockroachdb/pebble/internal/writequota"
 	"github.com/cockroachdb/pebble/metrics"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/remote"
@@ -302,6 +303,10 @@ type DB struct {
 	tableNewRangeKeyIter keyspanimpl.TableNewSpanIter
 
 	commit *commitPipeline
+
+	// writeQuota is the per-user-key-range write admission manager; nil when
+	// the experimental feature is disabled.
+	writeQuota *writeQuotaManager
 
 	// readState provides access to the state needed for reading without needing
 	// to acquire DB.mu.
@@ -763,7 +768,26 @@ func (d *DB) RangeKeyDelete(start, end []byte, opts *WriteOptions) error {
 //
 // Apply returns ErrInvalidBatch if the provided batch is invalid in any way.
 func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
-	return d.applyInternal(batch, opts, false)
+	return d.applyInternal(context.Background(), batch, opts, false)
+}
+
+// ApplyWithContext is like Apply, except that the context may cancel a write
+// that is queued waiting for write-quota admission (it returns the context
+// error). Once the batch begins committing (sequence-number allocation, WAL
+// write, memtable application), ctx is not observed and the commit follows
+// the normal durability semantics.
+//
+// A closed database interrupting an admission wait causes ErrClosed. A batch
+// rejected by a write-quota rule returns an error wrapping
+// ErrWriteQuotaExceeded; no sequence number, WAL bytes, or memtable memory
+// have been consumed and the batch may be retried after Reset.
+//
+// Experimental.
+func (d *DB) ApplyWithContext(ctx context.Context, batch *Batch, opts *WriteOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return d.applyInternal(ctx, batch, opts, false)
 }
 
 // ApplyNoSyncWait must only be used when opts.Sync is true and the caller
@@ -782,11 +806,11 @@ func (d *DB) ApplyNoSyncWait(batch *Batch, opts *WriteOptions) error {
 	if !opts.GetSync() {
 		return errors.Errorf("cannot request asynchronous apply when WriteOptions.Sync is false")
 	}
-	return d.applyInternal(batch, opts, true)
+	return d.applyInternal(context.Background(), batch, opts, true)
 }
 
 // REQUIRES: noSyncWait => opts.Sync
-func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) error {
+func (d *DB) applyInternal(ctx context.Context, batch *Batch, opts *WriteOptions, noSyncWait bool) error {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -831,9 +855,53 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 		var err error
 		batch.flushable, err = newFlushableBatch(batch, d.opts.Comparer)
 		if err != nil {
+			batch.committing = false
 			return err
 		}
 	}
+	// Write-quota admission. This happens strictly before any sequence number
+	// is allocated, WAL bytes are written, or memtable memory is reserved, so
+	// quota rejections return a regular business error (instead of reaching
+	// the fatal-on-commit-error handling below) and consume nothing.
+	var quotaGrant *writequota.Grant
+	if d.writeQuota != nil {
+		if qc := d.writeQuota.current(); qc != nil {
+			demands, err := qc.scanBatch(batch)
+			if err != nil {
+				batch.committing = false
+				return err
+			}
+			if len(demands) > 0 {
+				g, err := d.writeQuota.wm.Admit(ctx, writequota.Request{
+					Demands:  demands,
+					Priority: opts.GetPriority(),
+				})
+				if err != nil {
+					batch.committing = false
+					return mapWriteQuotaAdmitErr(err)
+				}
+				quotaGrant = g
+				batch.quotaGrant = g
+				batch.commitStats.QuotaWaitDuration += g.WaitDuration()
+			}
+		}
+	}
+	// For a large (flushable) batch the grant is attached before commit so
+	// that its UnflushedBytes reservation is released exactly when the
+	// flushable finishes flushing.
+	if batch.flushable != nil && quotaGrant != nil {
+		batch.flushable.flushableQuota.addGrant(quotaGrant)
+	}
+	// The commit-scoped reservation is released when the commit completes
+	// (including the WAL sync for synchronous writes). For ApplyNoSyncWait the
+	// ownership is transferred to the Batch until SyncWait. The deferred call
+	// also covers fatal/Goexit unwind paths.
+	quotaGrantTransferred := false
+	defer func() {
+		if quotaGrant != nil && !quotaGrantTransferred {
+			quotaGrant.ReleaseCommitted()
+		}
+	}()
 	if err := d.commit.Commit(batch, sync, noSyncWait); err != nil {
 		// There isn't much we can do on an error here. The commit pipeline will be
 		// horked at this point.
@@ -849,17 +917,29 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 	if batch.flushable != nil {
 		batch.data = nil
 	}
+	if noSyncWait && quotaGrant != nil {
+		// The grant is already referenced by the batch; its commit-scoped
+		// reservation stays held until SyncWait. Suppress the deferred release.
+		quotaGrantTransferred = true
+	}
 	return nil
 }
 
 func (d *DB) commitApply(b *Batch, mem *memTable) error {
 	if b.flushable != nil {
-		// This is a large batch which was already added to the immutable queue.
+		// This is a large batch which was already added to the immutable queue
+		// (its quota grant was attached to the flushable before commit).
 		return nil
 	}
 	err := mem.apply(b, b.SeqNum())
 	if err != nil {
 		return err
+	}
+	// Attach the grant's UnflushedBytes reservation to the concrete memtable
+	// so that it is released when this memtable flushes. Safe to call
+	// concurrently with other commits applying to the same memtable.
+	if b.quotaGrant != nil {
+		mem.flushableQuota.addGrant(b.quotaGrant)
 	}
 
 	// If the batch contains range tombstones and the database is configured
@@ -1863,6 +1943,9 @@ func (d *DB) Close() error {
 	d.closed.Store(errors.WithStack(ErrClosed))
 	close(d.closedCh)
 	d.bgCtxCancel()
+	// Wake any writes blocked in write-quota admission so they observe the
+	// closed database instead of waiting indefinitely.
+	d.writeQuota.close()
 
 	defer d.cacheHandle.Close()
 

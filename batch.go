@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/internal/rawalloc"
 	"github.com/cockroachdb/pebble/internal/treesteps"
+	"github.com/cockroachdb/pebble/internal/writequota"
 )
 
 const (
@@ -412,6 +413,10 @@ type batchInternal struct {
 
 	commitErr error
 
+	// quotaGrant is set for ApplyNoSyncWait commits whose commit-scoped write
+	// quota reservation must remain held until SyncWait; SyncWait releases it.
+	quotaGrant *writequota.Grant
+
 	// Position bools together to reduce the sizeof the struct.
 
 	// ingestedSSTBatch indicates that the batch contains one or more key kinds
@@ -474,6 +479,10 @@ type BatchCommitStats struct {
 	// duration for the WAL sync (if requested). The former should be tiny and
 	// one can assume that this is all due to the WAL sync.
 	CommitWaitDuration time.Duration
+	// QuotaWaitDuration is the time spent waiting for write-quota admission
+	// before the commit began. Zero when write quotas are disabled or the
+	// request was admitted immediately.
+	QuotaWaitDuration time.Duration
 }
 
 var _ Reader = (*Batch)(nil)
@@ -1572,6 +1581,16 @@ func (b *Batch) Commit(o *WriteOptions) error {
 	return b.db.Apply(b, o)
 }
 
+// CommitWithContext is like Commit but allows the context to cancel a write
+// that is queued waiting for write-quota admission. Once the batch begins
+// committing (WAL write or memtable application), the context is no longer
+// observed.
+//
+// Experimental.
+func (b *Batch) CommitWithContext(ctx context.Context, o *WriteOptions) error {
+	return b.db.ApplyWithContext(ctx, b, o)
+}
+
 // Close closes the batch without committing it.
 func (b *Batch) Close() error {
 	// The storage engine commit pipeline may retain a pointer to b.data beyond
@@ -1738,6 +1757,12 @@ func (b *Batch) Reader() batchrepr.Reader {
 func (b *Batch) SyncWait() error {
 	now := crtime.NowMono()
 	b.fsyncWait.Wait()
+	if b.quotaGrant != nil {
+		// The commit-scoped quota reservation was held through the async WAL
+		// sync; release it now that the sync outcome is known.
+		b.quotaGrant.ReleaseCommitted()
+		b.quotaGrant = nil
+	}
 	if b.commitErr != nil {
 		b.db = nil // prevent batch reuse on error
 	}
@@ -1996,6 +2021,10 @@ type flushableBatch struct {
 
 	// Fragmented range keys.
 	rangeKeys []keyspan.Span
+
+	// flushableQuota tracks write-quota reservations held until this
+	// flushable batch flushes.
+	flushableQuota
 }
 
 var _ flushable = (*flushableBatch)(nil)

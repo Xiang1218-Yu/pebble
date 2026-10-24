@@ -184,6 +184,10 @@ type ingestedFlushable struct {
 	// for ingestedFlushables and is also used to populate the version edit.
 	// Nil if no blob files were ingested.
 	blobFileMap map[base.BlobFileID]*manifest.PhysicalBlobFile
+
+	// flushableQuota tracks write-quota reservations held until this ingested
+	// flushable flushes.
+	flushableQuota
 }
 
 func newIngestedFlushable(
